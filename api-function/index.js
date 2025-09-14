@@ -1,5 +1,5 @@
 import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
-import { DynamoDBDocumentClient, PutCommand, ScanCommand, DeleteCommand, GetCommand } from "@aws-sdk/lib-dynamodb";
+import { DynamoDBDocumentClient, PutCommand, DeleteCommand, GetCommand, QueryCommand } from "@aws-sdk/lib-dynamodb";
 import { SQSClient, SendMessageCommand } from "@aws-sdk/client-sqs";
 import crypto from "node:crypto";
 
@@ -47,7 +47,7 @@ export const handler = async (event) => {
             const id = crypto.randomUUID();
             const now = new Date().toISOString();
             
-            const item = { id, topic, status: "QUEUED", createdAt: now, updatedAt: now, researchMd: "", error: null };
+            const item = { id, pk: "TASK", topic, status: "QUEUED", createdAt: now, updatedAt: now, researchMd: "", error: null };
             
             console.log("🟢 [DynamoDB] Put item:", item);
             await ddb.send(new PutCommand({
@@ -68,7 +68,7 @@ export const handler = async (event) => {
             return res(201, { id, topic, status: "QUEUED", createdAt: now });
         }
         
-        // GET /tasks — список задач (простий Scan з курсором)
+        // GET /tasks — відсортований список (нові → старі) з курсором через GSI byCreatedAt
         if (event.httpMethod === "GET" && event.path?.endsWith("/tasks") && event.resource !== "/tasks/{id}") {
             console.log("🟢 [ROUTE] GET /tasks");
             
@@ -76,16 +76,20 @@ export const handler = async (event) => {
             const limit = Math.min(Number(qs.limit || 25), 100);
             const startKey = qs.cursor ? JSON.parse(Buffer.from(qs.cursor, "base64").toString("utf8")) : undefined;
             
-            console.log("🟢 [DynamoDB] Scan start. limit:", limit, "startKey:", startKey);
-            const out = await ddb.send(new ScanCommand({
+            console.log("🟢 [DynamoDB] Query start (byCreatedAt). limit:", limit, "startKey:", startKey);
+            const out = await ddb.send(new QueryCommand({
                 TableName: TABLE_NAME,
-                ProjectionExpression: "id, topic, #s, createdAt, updatedAt",
-                ExpressionAttributeNames: { "#s": "status" },
+                IndexName: "byCreatedAt",
+                KeyConditionExpression: "pk = :p",
+                ExpressionAttributeValues: { ":p": "TASK" },
                 Limit: limit,
-                ExclusiveStartKey: startKey
+                ScanIndexForward: false,
+                ExclusiveStartKey: startKey,
+                ProjectionExpression: "id, topic, #s, createdAt, updatedAt",
+                ExpressionAttributeNames: { "#s": "status" }
             }));
             const cursor = out.LastEvaluatedKey ? Buffer.from(JSON.stringify(out.LastEvaluatedKey)).toString("base64") : null;
-            console.log("🟢 [DynamoDB] Scan done. count:", (out.Items || []).length, "hasMore:", !!out.LastEvaluatedKey);
+            console.log("🟢 [DynamoDB] Query done. count:", (out.Items || []).length, "hasMore:", !!out.LastEvaluatedKey);
             
             return res(200, { items: out.Items || [], cursor });
         }
