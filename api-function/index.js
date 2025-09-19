@@ -6,6 +6,9 @@ import crypto from "node:crypto";
 const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({}));
 const sqs = new SQSClient({});
 
+// TABLE_NAME 
+// QUEUE_URL
+
 const cors = {
     "Access-Control-Allow-Origin": "*",
     "Access-Control-Allow-Headers": "Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token",
