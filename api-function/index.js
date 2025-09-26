@@ -240,6 +240,7 @@ export const handler = async (event) => {
             const item = {
                 id,
                 pk: "TASK",
+                userId: user?.id || "anonymous",
                 topic,
                 status: "QUEUED",
                 createdAt: now,
@@ -303,14 +304,20 @@ export const handler = async (event) => {
                 "🟢 [DynamoDB] Query start (byCreatedAt). limit:",
                 limit,
                 "startKey:",
-                startKey
+                startKey,
+                "userId:",
+                user?.id || "anonymous"
             );
             const out = await ddb.send(
                 new QueryCommand({
                     TableName: tableName,
                     IndexName: "byCreatedAt",
                     KeyConditionExpression: "pk = :p",
-                    ExpressionAttributeValues: { ":p": "TASK" },
+                    FilterExpression: "userId = :u",
+                    ExpressionAttributeValues: { 
+                        ":p": "TASK",
+                        ":u": user?.id || "anonymous"
+                    },
                     Limit: limit,
                     ScanIndexForward: false,
                     ExclusiveStartKey: startKey,
@@ -345,6 +352,15 @@ export const handler = async (event) => {
                 console.warn("🟠 [DynamoDB] Not found id:", id);
                 return res(404, { message: "Not Found" });
             }
+            
+            // Перевіряємо чи задача належить користувачу
+            const itemUserId = out.Item.userId || "anonymous";
+            const currentUserId = user?.id || "anonymous";
+            if (itemUserId !== currentUserId) {
+                console.warn("🟠 [AUTH] Access denied for task id:", id, "itemUserId:", itemUserId, "currentUserId:", currentUserId);
+                return res(403, { message: "Access Denied" });
+            }
+            
             console.log("🟢 [DynamoDB] Found item id:", id);
             return res(200, out.Item, 
                 user ? { "X-User-ID": user.id } : {});
@@ -355,6 +371,23 @@ export const handler = async (event) => {
             const id = event.pathParameters?.id;
             console.log("🟢 [ROUTE] DELETE /tasks/{id} id:", id);
             if (!id) return res(400, { message: "Missing path param 'id'" });
+            
+            // Спочатку перевіряємо чи задача існує та належить користувачу
+            const getOut = await ddb.send(
+                new GetCommand({ TableName: tableName, Key: { id } })
+            );
+            if (!getOut.Item) {
+                console.warn("🟠 [DynamoDB] Not found id:", id);
+                return res(404, { message: "Not Found" });
+            }
+            
+            // Перевіряємо чи задача належить користувачу
+            const itemUserId = getOut.Item.userId || "anonymous";
+            const currentUserId = user?.id || "anonymous";
+            if (itemUserId !== currentUserId) {
+                console.warn("🟠 [AUTH] Access denied for task id:", id, "itemUserId:", itemUserId, "currentUserId:", currentUserId);
+                return res(403, { message: "Access Denied" });
+            }
             
             await ddb.send(new DeleteCommand({ TableName: tableName, Key: { id } }));
             console.log("🟢 [DynamoDB] Deleted id:", id);
