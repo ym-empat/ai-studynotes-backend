@@ -17,6 +17,8 @@ import crypto from "node:crypto";
 * Ключі очікуються в SSM:
 *  - /ai-studynotes/dynamo-db-table-name  (String або SecureString)
 *  - /ai-studynotes/sqs-queue-url         (String або SecureString, опціонально)
+*  - /ai-studynotes/cognito-user-pool-id  (String або SecureString, опціонально)
+*  - /ai-studynotes/cognito-client-id     (String або SecureString, опціонально)
 *
 * Можна змінити базовий шлях і TTL кешу через env:
 *  - CONFIG_BASE_PATH (дефолт: "/ai-studynotes")
@@ -62,6 +64,103 @@ async function loadConfig() {
 
 /**
 * --------------------------------------------
+* JWT parsing utilities
+* --------------------------------------------
+*/
+function parseJWT(token) {
+    try {
+        const parts = token.split('.');
+        if (parts.length !== 3) {
+            throw new Error('Invalid JWT format');
+        }
+        
+        // Декодуємо payload (друга частина)
+        const payload = parts[1];
+        // Додаємо padding якщо потрібно
+        const paddedPayload = payload + '='.repeat((4 - payload.length % 4) % 4);
+        const decodedPayload = Buffer.from(paddedPayload, 'base64url').toString('utf8');
+        
+        return JSON.parse(decodedPayload);
+    } catch (error) {
+        throw new Error(`Failed to parse JWT: ${error.message}`);
+    }
+}
+
+function isTokenExpired(payload) {
+    if (!payload.exp) return true;
+    const now = Math.floor(Date.now() / 1000);
+    return payload.exp < now;
+}
+
+/**
+* --------------------------------------------
+* Authentication
+* --------------------------------------------
+*/
+async function getAuthenticatedUser(event, config) {
+    const userPoolId = config["cognito-user-pool-id"];
+    const clientId = config["cognito-client-id"];
+    
+    if (!userPoolId || !clientId) {
+        console.warn("🟠 [AUTH] Cognito config not found in SSM - skipping auth");
+        return null;
+    }
+
+    const authHeader = event.headers?.Authorization || event.headers?.authorization;
+    if (!authHeader) {
+        console.warn("🟠 [AUTH] No Authorization header");
+        return null;
+    }
+
+    const token = authHeader.replace(/^Bearer\s+/i, "");
+    if (!token) {
+        console.warn("🟠 [AUTH] No token in Authorization header");
+        return null;
+    }
+
+    try {
+        // Парсимо ID токен
+        const payload = parseJWT(token);
+        
+        // Перевіряємо чи токен не прострочений
+        if (isTokenExpired(payload)) {
+            console.warn("🟠 [AUTH] Token expired");
+            return null;
+        }
+        
+        // Перевіряємо чи токен від правильного User Pool та Client
+        if (payload.iss !== `https://cognito-idp.${userPoolId.split('_')[0]}.amazonaws.com/${userPoolId}`) {
+            console.warn("🟠 [AUTH] Token issuer mismatch");
+            return null;
+        }
+        
+        if (payload.aud !== clientId) {
+            console.warn("🟠 [AUTH] Token audience mismatch");
+            return null;
+        }
+        
+        if (payload.token_use !== 'id') {
+            console.warn("🟠 [AUTH] Token is not an ID token");
+            return null;
+        }
+        
+        console.log("🟢 [AUTH] ID token verified for user:", payload.sub);
+        
+        return {
+            id: payload.sub,
+            email: payload.email,
+            username: payload['cognito:username'],
+            userStatus: payload['cognito:user_status'],
+            payload: payload
+        };
+    } catch (error) {
+        console.warn("🟠 [AUTH] Token verification failed:", error.message);
+        return null;
+    }
+}
+
+/**
+* --------------------------------------------
 * AWS clients
 * --------------------------------------------
 */
@@ -102,8 +201,12 @@ export const handler = async (event) => {
             console.log("🟢 [API] OPTIONS preflight");
             return { statusCode: 200, headers: cors, body: "" };
         }
-        
+
         const config = await loadConfig();
+        
+        // Отримуємо авторизованого користувача
+        const user = await getAuthenticatedUser(event, config);
+        console.log("🟢 [AUTH] User:", user ? `ID: ${user.id}` : "Not authenticated");
         const tableName = config["dynamo-db-table-name"];
         const queueUrl = config["sqs-queue-url"]; // може бути undefined
         
@@ -178,7 +281,8 @@ export const handler = async (event) => {
                 console.log("🟠 [SQS] sqs-queue-url not set — skipping enqueue");
             }
             
-            return res(201, { id, topic, status: "QUEUED", createdAt: now });
+            return res(201, { id, topic, status: "QUEUED", createdAt: now }, 
+                user ? { "X-User-ID": user.id } : {});
         }
         
         // GET /tasks — відсортований список (нові → старі) з курсором через GSI byCreatedAt
@@ -224,7 +328,8 @@ export const handler = async (event) => {
                 !!out.LastEvaluatedKey
             );
             
-            return res(200, { items: out.Items || [], cursor });
+            return res(200, { items: out.Items || [], cursor }, 
+                user ? { "X-User-ID": user.id } : {});
         }
         
         // GET /tasks/{id} — один запис (включно з researchMd)
@@ -241,7 +346,8 @@ export const handler = async (event) => {
                 return res(404, { message: "Not Found" });
             }
             console.log("🟢 [DynamoDB] Found item id:", id);
-            return res(200, out.Item);
+            return res(200, out.Item, 
+                user ? { "X-User-ID": user.id } : {});
         }
         
         // DELETE /tasks/{id}
@@ -252,7 +358,8 @@ export const handler = async (event) => {
             
             await ddb.send(new DeleteCommand({ TableName: tableName, Key: { id } }));
             console.log("🟢 [DynamoDB] Deleted id:", id);
-            return res(204, "");
+            return res(204, "", 
+                user ? { "X-User-ID": user.id } : {});
         }
         
         console.warn(
@@ -268,8 +375,9 @@ export const handler = async (event) => {
     }
 };
 
-function res(statusCode, data) {
+function res(statusCode, data, additionalHeaders = {}) {
     const payload = typeof data === "string" ? data : JSON.stringify(data);
+    const headers = { ...cors, ...additionalHeaders };
     console.log(
         "🟢 [API] Response",
         statusCode,
@@ -277,5 +385,5 @@ function res(statusCode, data) {
         ? payload.slice(0, 600) + "…(truncated)"
         : payload
     );
-    return { statusCode, headers: cors, body: payload };
+    return { statusCode, headers, body: payload };
 }
